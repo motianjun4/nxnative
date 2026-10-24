@@ -1847,6 +1847,7 @@ static void frame_end(void) {
              (unsigned long long)f, foot / 1048576.0, g_dev.currentAllocatedSize / 1048576.0, nt, nb, bb / 1048576.0, g_narena);
     }
     dm_guest_frame_tick();
+    dm_host_frame_tick();   // the touch snapshot cache's frame (hle_touch.c): every graphics layer ticks it at its frame end
 }
 EGL(eglGetDisplay, EGLDisplay, void *native) { (void)native; dev_init(); return (EGLDisplay)&g_egl; }
 EGL(eglInitialize, EGLBoolean, EGLDisplay d, EGLint *major, EGLint *minor) { (void)d; dev_init(); g_egl.init = 1; if (major) *major = 1; if (minor) *minor = 5; return EGL_TRUE; }

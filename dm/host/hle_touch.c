@@ -10,11 +10,21 @@
 #include "front.h"
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 enum { F_EMPTY, F_DOWN, F_LIFTED };
 static struct { int st, reported, again; float x, y, ax, ay; } g_f[16];   // again/ax/ay: the same id was pressed again before End went out (the next read reports End first, then the new Start)
 static struct { int down, pend; float x, y; } g_gf[16];   // the gesture recognizer's own view of the fingers; pend: pressed since its last sample (a press and lift between two samples still counts once)
 static pthread_mutex_t g_tl = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_tsamp; static uint64_t g_tlast_ns;
+// One present counter for every graphics layer (each ticks it at frame end, beside dm_guest_frame_tick);
+// defined here, beside its only reader, so the host tests keep linking hle_touch.c on its own.
+static _Atomic uint64_t g_host_frame;
+uint64_t dm_host_frame_count(void) { return atomic_load(&g_host_frame); }
+void dm_host_frame_tick(void) { atomic_fetch_add(&g_host_frame, 1); }
+// Frame-coherent snapshots: the touch state is shared memory on hardware, so every reader in a frame sees
+// the same state; the latch below advances per read instead, and a game polling several times a frame loses
+// tap Start edges to the first reader. Cache the filled state per host frame, filled full width (16 points).
+static uint8_t g_snap[0x10 + 0x28 * 16]; static int g_snap_k = -1; static uint64_t g_snap_frame;
 
 void dm_touch_set(const dm_touch *t, int n) {
     pthread_mutex_lock(&g_tl);
@@ -39,19 +49,26 @@ void dm_touch_set(const dm_touch *t, int n) {
 
 static int32_t clampi(float v, int hi) { int32_t r = (int32_t)(v * (float)(hi + 1)); return r < 0 ? 0 : r > hi ? hi : r; }
 // Fill one TouchScreenState<max> (out is 0x10 + 0x28 · max bytes; max 1–16); now_ns is used for delta_time. Returns the number of touch points written.
-// Fingers beyond max are left for a later read (their Start / End is not used up)
 int touch_fill_n(void *out, int max, uint64_t now_ns) {
     if (max < 1) max = 1; else if (max > 16) max = 16;
     uint8_t *o = out; memset(o, 0, 0x10 + 0x28 * (size_t)max);
     pthread_mutex_lock(&g_tl);
+    uint64_t fr = dm_host_frame_count();
+    if (g_snap_k >= 0 && fr == g_snap_frame) {
+        int32_t cnt = g_snap_k < max ? g_snap_k : max;
+        memcpy(o, g_snap, 0x10 + 0x28 * (size_t)cnt); memcpy(o + 8, &cnt, 4);
+        pthread_mutex_unlock(&g_tl);
+        return cnt;
+    }
     int64_t samp = ++g_tsamp; int64_t dt = g_tlast_ns ? (int64_t)(now_ns - g_tlast_ns) : 0; g_tlast_ns = now_ns;
+    memset(g_snap, 0, sizeof g_snap);
     int k = 0;
-    for (int id = 0; id < 16 && k < max; id++) {
+    for (int id = 0; id < 16 && k < 16; id++) {
         if (g_f[id].st == F_EMPTY) continue;
         uint32_t attr = 0;
         if (!g_f[id].reported) { attr |= 1; g_f[id].reported = 1; }          // Start (reported for the first time this time)
         else if (g_f[id].st == F_LIFTED) attr |= 2;                         // End (Start already reported, already lifted)
-        uint8_t *s = o + 0x10 + 0x28 * k++;
+        uint8_t *s = g_snap + 0x10 + 0x28 * k++;
         int32_t x = clampi(g_f[id].x, 1279), y = clampi(g_f[id].y, 719), d = 30, zero = 0, fid = id;
         memcpy(s + 0x00, &dt, 8); memcpy(s + 0x08, &attr, 4); memcpy(s + 0x0c, &fid, 4);
         memcpy(s + 0x10, &x, 4); memcpy(s + 0x14, &y, 4); memcpy(s + 0x18, &d, 4); memcpy(s + 0x1c, &d, 4); memcpy(s + 0x20, &zero, 4);
@@ -60,17 +77,19 @@ int touch_fill_n(void *out, int max, uint64_t now_ns) {
             else g_f[id].st = F_EMPTY;
         }
     }
+    memcpy(g_snap, &samp, 8); memcpy(g_snap + 8, &k, 4); g_snap_k = k; g_snap_frame = fr;
+    int32_t cnt = k < max ? k : max;
+    memcpy(o, g_snap, 0x10 + 0x28 * (size_t)cnt); memcpy(o + 8, &cnt, 4);
     pthread_mutex_unlock(&g_tl);
-    int32_t cnt = k; memcpy(o + 0, &samp, 8); memcpy(o + 8, &cnt, 4);
     // DM_TOUCH_LOG=1 (acceptance diagnostics): each read with non-zero touch points logs one line -- sample number, touch count, and for each point finger_id / panel x,y / attributes (1 Start, 2 End); capped at 500 lines
     static int lg = -1, nl; if (lg < 0) lg = getenv("DM_TOUCH_LOG") != NULL;
-    if (lg && k && nl < 500) {
-        char b[256]; int m = snprintf(b, sizeof b, "touch read sample %lld points %d", (long long)samp, k);
-        for (int i = 0; i < k && m < (int)sizeof b - 40; i++) { int32_t v[4]; memcpy(v, o + 0x10 + 0x28 * i + 0x08, 16);
+    if (lg && cnt && nl < 500) {
+        char b[256]; int m = snprintf(b, sizeof b, "touch read sample %lld points %d", (long long)samp, cnt);
+        for (int i = 0; i < cnt && m < (int)sizeof b - 40; i++) { int32_t v[4]; memcpy(v, o + 0x10 + 0x28 * i + 0x08, 16);
             m += snprintf(b + m, sizeof b - m, " | #%d (%d,%d) attribute %d", v[1], v[2], v[3], v[0]); }
         LOG("%s", b); if (++nl == 500) LOG("DM_TOUCH_LOG reached 500 lines, logging stopped");
     }
-    return k;
+    return cnt;
 }
 int touch_fill(void *out, uint64_t now_ns) { return touch_fill_n(out, 16, now_ns); }   // TouchScreenState<16>, 0x290 bytes
 

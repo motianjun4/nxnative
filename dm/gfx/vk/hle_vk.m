@@ -1516,6 +1516,7 @@ static void frame_end(void) {
              (unsigned long long)(pa - pp), (unsigned long long)(su - ps), (unsigned long long)(co - pc), (unsigned long long)(f <= 3 ? 1 : 300), (unsigned long long)g_n_pso, g_mem_bytes / 1048576.0);
     if (f <= 3 || f % 300 == 0) { pd = dr; pp = pa; ps = su; pc = co; }
     dm_guest_frame_tick();
+    dm_host_frame_tick();   // the touch snapshot cache's frame (hle_touch.c): every graphics layer ticks it at its frame end
 }
 VKB(vkQueuePresentKHR, VkResult, VkQueue q, const VkPresentInfoKHR *pi) {
     (void)q; dm_gfx_enter();
